@@ -318,6 +318,9 @@ type Item struct {
 	// up to the app.
 	Flags uint32
 
+	//VbucketId is the id of vubcket node which contains the Item
+	VbucketId uint32
+
 	// Expiration is the cache expiration time, in seconds: either a relative
 	// time from now (up to 1 month), or an absolute Unix epoch time.
 	// Zero means the Item has no expiration time.
@@ -325,6 +328,13 @@ type Item struct {
 
 	// Compare and swap ID.
 	casid uint64
+}
+
+type commandItem struct {
+	item   *Item
+	cmd    command
+	extras []byte
+	client *Client
 }
 
 // conn is a connection to a server.
@@ -448,15 +458,22 @@ func (c *Client) getConn(addr *Addr) (*conn, error) {
 // Get gets the item for the given key. ErrCacheMiss is returned for a
 // memcache cache miss. The key must be at most 250 bytes in length.
 func (c *Client) Get(key string) (*Item, error) {
-	cn, err := c.sendCommand(key, cmdGet, nil, 0, nil)
+	cmdItem := &commandItem{
+		item: &Item{
+			Key: key,
+		},
+		cmd: cmdGet,
+	}
+
+	cn, err := c.send(cmdItem)
 	if err != nil {
 		return nil, err
 	}
 	return c.parseItemResponse(key, cn, true)
 }
 
-func (c *Client) sendCommand(key string, cmd command, value []byte, casid uint64, extras []byte) (*conn, error) {
-	addr, err := c.servers.PickServer(key)
+func (c *Client) send(cmdItem *commandItem) (*conn, error) {
+	addr, err := c.servers.PickServer(cmdItem.item.Key)
 	if err != nil {
 		return nil, err
 	}
@@ -464,15 +481,68 @@ func (c *Client) sendCommand(key string, cmd command, value []byte, casid uint64
 	if err != nil {
 		return nil, err
 	}
-	err = c.sendConnCommand(cn, key, cmd, value, casid, extras)
+	err = c.sendConn(cmdItem, cn)
 	if err != nil {
 		cn.nc.Close()
 		return nil, err
 	}
 	return cn, err
+
 }
 
-func (c *Client) sendConnCommand(cn *conn, key string, cmd command, value []byte, casid uint64, extras []byte) (err error) {
+func (c *Client) sendConn(cmdItem *commandItem, cn *conn) (err error) {
+	var buf []byte
+	select {
+	// 24 is header size
+	case buf = <-c.bufPool:
+		buf = buf[:24]
+	default:
+		buf = make([]byte, 24, 24+len(cmdItem.item.Key)+len(cmdItem.extras))
+		// Magic (0)
+		buf[0] = reqMagic
+	}
+	// Command (1)
+	buf[1] = byte(cmdItem.cmd)
+	kl := len(cmdItem.item.Key)
+	el := len(cmdItem.extras)
+	// Key length (2-3)
+	putUint16(buf[2:], uint16(kl))
+	// Extras length (4)
+	buf[4] = byte(el)
+	// Data type (5), always zero
+	// VBucket (6-7), always zero
+	putUint16(buf[6:], uint16(cmdItem.item.VbucketId))
+	// Total body length (8-11)
+	vl := len(cmdItem.item.Value)
+	bl := uint32(kl + el + vl)
+	putUint32(buf[8:], bl)
+	// Opaque (12-15), always zero
+	// CAS (16-23)
+	putUint64(buf[16:], cmdItem.item.casid)
+	// Extras
+	if el > 0 {
+		buf = append(buf, cmdItem.extras...)
+	}
+	if kl > 0 {
+		// Key itself
+		buf = append(buf, stobs(cmdItem.item.Key)...)
+	}
+	if _, err = cn.nc.Write(buf); err != nil {
+		return err
+	}
+	select {
+	case c.bufPool <- buf:
+	default:
+	}
+	if vl > 0 {
+		if _, err = cn.nc.Write(cmdItem.item.Value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) sendConnCommand(cn *conn, key string, cmd command, value []byte, casid uint64, extras []byte, vbucketid uint32) (err error) {
 	var buf []byte
 	select {
 	// 24 is header size
@@ -493,6 +563,7 @@ func (c *Client) sendConnCommand(cn *conn, key string, cmd command, value []byte
 	buf[4] = byte(el)
 	// Data type (5), always zero
 	// VBucket (6-7), always zero
+	putUint16(buf[6:], uint16(vbucketid))
 	// Total body length (8-11)
 	vl := len(value)
 	bl := uint32(kl + el + vl)
@@ -602,14 +673,14 @@ func (c *Client) parseItemResponse(key string, cn *conn, release bool) (*Item, e
 	}, nil
 }
 
-// GetMulti is a batch version of Get. The returned map from keys to
+// GetMultiByVBucketId is a batch version of Get. The returned map from keys to
 // items may have fewer elements than the input slice, due to memcache
 // cache misses. Each key must be at most 250 bytes in length.
 // If no error is returned, the returned map will also be non-nil.
-func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
-	keyMap := make(map[*Addr][]string)
+func (c *Client) GetMultiItem(keys []*Item) (map[string]*Item, error) {
+	keyMap := make(map[*Addr][]*Item)
 	for _, key := range keys {
-		addr, err := c.servers.PickServer(key)
+		addr, err := c.servers.PickServer(key.Key)
 		if err != nil {
 			return nil, err
 		}
@@ -620,7 +691,7 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 	for addr, keys := range keyMap {
 		ch := make(chan *Item)
 		chs = append(chs, ch)
-		go func(addr *Addr, keys []string, ch chan *Item) {
+		go func(addr *Addr, keys []*Item, ch chan *Item) {
 			defer close(ch)
 			cn, err := c.getConn(addr)
 			if err != nil {
@@ -628,11 +699,11 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 			}
 			defer c.condRelease(cn, &err)
 			for _, k := range keys {
-				if err = c.sendConnCommand(cn, k, cmdGetKQ, nil, 0, nil); err != nil {
+				if err = c.sendConnCommand(cn, k.Key, cmdGetKQ, nil, 0, nil, k.VbucketId); err != nil {
 					return
 				}
 			}
-			if err = c.sendConnCommand(cn, "", cmdNoop, nil, 0, nil); err != nil {
+			if err = c.sendConnCommand(cn, "", cmdNoop, nil, 0, nil, 0); err != nil {
 				return
 			}
 			var item *Item
@@ -654,6 +725,68 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 		}
 	}
 	return m, nil
+}
+
+// GetMultiByVBucketId is a batch version of Get. The returned map from keys to
+// items may have fewer elements than the input slice, due to memcache
+// cache misses. Each key must be at most 250 bytes in length.
+// If no error is returned, the returned map will also be non-nil.
+func (c *Client) GetMultiByVBucketId(keys []string, vbucketId uint32) (map[string]*Item, error) {
+	keyMap := make(map[*Addr][]string)
+	for _, key := range keys {
+		addr, err := c.servers.PickServer(key)
+		if err != nil {
+			return nil, err
+		}
+		keyMap[addr] = append(keyMap[addr], key)
+	}
+
+	var chs []chan *Item
+	for addr, keys := range keyMap {
+		ch := make(chan *Item)
+		chs = append(chs, ch)
+		go func(addr *Addr, keys []string, ch chan *Item) {
+			defer close(ch)
+			cn, err := c.getConn(addr)
+			if err != nil {
+				return
+			}
+			defer c.condRelease(cn, &err)
+			for _, k := range keys {
+				if err = c.sendConnCommand(cn, k, cmdGetKQ, nil, 0, nil, vbucketId); err != nil {
+					return
+				}
+			}
+			if err = c.sendConnCommand(cn, "", cmdNoop, nil, 0, nil, vbucketId); err != nil {
+				return
+			}
+			var item *Item
+			for {
+				item, err = c.parseItemResponse("", cn, false)
+				if item == nil || item.Key == "" {
+					// Noop response
+					break
+				}
+				ch <- item
+			}
+		}(addr, keys, ch)
+	}
+
+	m := make(map[string]*Item)
+	for _, ch := range chs {
+		for item := range ch {
+			m[item.Key] = item
+		}
+	}
+	return m, nil
+}
+
+// GetMulti is a batch version of Get. The returned map from keys to
+// items may have fewer elements than the input slice, due to memcache
+// cache misses. Each key must be at most 250 bytes in length.
+// If no error is returned, the returned map will also be non-nil.
+func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
+	return c.GetMultiByVBucketId(keys, 0)
 }
 
 // Set writes the given item, unconditionally.
@@ -682,7 +815,14 @@ func (c *Client) populateOne(cmd command, item *Item, casid uint64) error {
 	extras := make([]byte, 8)
 	putUint32(extras, item.Flags)
 	putUint32(extras[4:8], uint32(item.Expiration))
-	cn, err := c.sendCommand(item.Key, cmd, item.Value, casid, extras)
+	cmdItem := &commandItem{
+		item:   item,
+		cmd:    cmd,
+		extras: extras,
+	}
+	item.casid = casid
+
+	cn, err := c.send(cmdItem)
 	if err != nil {
 		return err
 	}
@@ -699,7 +839,13 @@ func (c *Client) populateOne(cmd command, item *Item, casid uint64) error {
 // Delete deletes the item with the provided key. The error ErrCacheMiss is
 // returned if the item didn't already exist in the cache.
 func (c *Client) Delete(key string) error {
-	cn, err := c.sendCommand(key, cmdDelete, nil, 0, nil)
+	cmdItem := &commandItem{
+		item: &Item{
+			Key: key,
+		},
+		cmd: cmdDelete,
+	}
+	cn, err := c.send(cmdItem)
 	if err != nil {
 		return err
 	}
@@ -735,7 +881,15 @@ func (c *Client) incrDecr(cmd command, key string, delta uint64) (uint64, error)
 	for ii := 16; ii < 20; ii++ {
 		extras[ii] = 0xff
 	}
-	cn, err := c.sendCommand(key, cmd, nil, 0, extras)
+
+	cmdItem := &commandItem{
+		item: &Item{
+			Key: key,
+		},
+		cmd:    cmd,
+		extras: extras,
+	}
+	cn, err := c.send(cmdItem)
 	if err != nil {
 		return 0, err
 	}
@@ -763,7 +917,7 @@ func (c *Client) Flush(expiration int) error {
 			errs = append(errs, err)
 			continue
 		}
-		if err = c.sendConnCommand(cn, "", cmdFlush, nil, 0, extras); err == nil {
+		if err = c.sendConnCommand(cn, "", cmdFlush, nil, 0, extras, 0); err == nil {
 			_, _, _, _, err = c.parseResponse("", cn)
 		}
 		if err != nil {
