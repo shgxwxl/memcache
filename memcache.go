@@ -85,14 +85,14 @@ const (
 type command uint8
 
 const (
-	cmdGet = iota
-	cmdSet
-	cmdAdd
-	cmdReplace
-	cmdDelete
-	cmdIncr
-	cmdDecr
-	cmdQuit
+	cmdGet     = iota //1
+	cmdSet            //2
+	cmdAdd            //3
+	cmdReplace        //4
+	cmdDelete         //5
+	cmdIncr           //6
+	cmdDecr           //7
+	cmdQuit           //8
 	cmdFlush
 	cmdGetQ
 	cmdNoop
@@ -112,6 +112,8 @@ const (
 	cmdFlushQ
 	cmdAppendQ
 	cmdPrependQ
+	cmdPrefixGet // 1b last one
+	cmdPrefixGetQ
 )
 
 type response uint16
@@ -673,11 +675,12 @@ func (c *Client) parseItemResponse(key string, cn *conn, release bool) (*Item, e
 	}, nil
 }
 
-// GetMultiByVBucketId is a batch version of Get. The returned map from keys to
-// items may have fewer elements than the input slice, due to memcache
-// cache misses. Each key must be at most 250 bytes in length.
-// If no error is returned, the returned map will also be non-nil.
-func (c *Client) GetMultiItem(keys []*Item) (map[string]*Item, error) {
+type pairCmd struct {
+	cmd    command
+	endCmd command
+}
+
+func (c *Client) sendMultiItem(keys []*Item, cmd *pairCmd) (map[string]*Item, error) {
 	keyMap := make(map[*Addr][]*Item)
 	for _, key := range keys {
 		addr, err := c.servers.PickServer(key.Key)
@@ -699,11 +702,11 @@ func (c *Client) GetMultiItem(keys []*Item) (map[string]*Item, error) {
 			}
 			defer c.condRelease(cn, &err)
 			for _, k := range keys {
-				if err = c.sendConnCommand(cn, k.Key, cmdGetKQ, nil, 0, nil, k.VbucketId); err != nil {
+				if err = c.sendConnCommand(cn, k.Key, cmd.cmd, nil, 0, nil, k.VbucketId); err != nil {
 					return
 				}
 			}
-			if err = c.sendConnCommand(cn, "", cmdNoop, nil, 0, nil, 0); err != nil {
+			if err = c.sendConnCommand(cn, "", cmd.endCmd, nil, 0, nil, 0); err != nil {
 				return
 			}
 			var item *Item
@@ -725,6 +728,31 @@ func (c *Client) GetMultiItem(keys []*Item) (map[string]*Item, error) {
 		}
 	}
 	return m, nil
+
+}
+
+// GetMultiItem is a batch version of Get. The returned map from keys to
+// items may have fewer elements than the input slice, due to memcache
+// cache misses. Each key must be at most 250 bytes in length.
+// If no error is returned, the returned map will also be non-nil.
+func (c *Client) GetMultiItem(keys []*Item) (map[string]*Item, error) {
+	cmd := &pairCmd{
+		cmd:    cmdGetKQ,
+		endCmd: cmdNoop,
+	}
+	return c.sendMultiItem(keys, cmd)
+}
+
+// GetMultiItem is a batch version of preffix get. The returned map from keys to
+// items may have fewer elements than the input slice, due to memcache
+// cache misses. Each key must be at most 250 bytes in length.
+// If no error is returned, the returned map will also be non-nil.
+func (c *Client) PrefixGetMultiItem(keys []*Item) (map[string]*Item, error) {
+	cmd := &pairCmd{
+		cmd:    cmdPrefixGetQ,
+		endCmd: cmdPrefixGet,
+	}
+	return c.sendMultiItem(keys, cmd)
 }
 
 // GetMultiByVBucketId is a batch version of Get. The returned map from keys to
