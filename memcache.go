@@ -474,6 +474,25 @@ func (c *Client) Get(key string) (*Item, error) {
 	return c.parseItemResponse(key, cn, true)
 }
 
+// GetByVbucket gets the item for the given key.
+// Vbucketid must be specified.ErrCacheMiss is returned for a
+// memcache cache miss. The key must be at most 250 bytes in length.
+func (c *Client) GetByVbucket(key string, vbucketid uint32) (*Item, error) {
+	cmdItem := &commandItem{
+		item: &Item{
+			Key:       key,
+			VbucketId: vbucketid,
+		},
+		cmd: cmdGet,
+	}
+
+	cn, err := c.send(cmdItem)
+	if err != nil {
+		return nil, err
+	}
+	return c.parseItemResponse(key, cn, true)
+}
+
 func (c *Client) send(cmdItem *commandItem) (*conn, error) {
 	addr, err := c.servers.PickServer(cmdItem.item.Key)
 	if err != nil {
