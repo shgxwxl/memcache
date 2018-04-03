@@ -1,5 +1,4 @@
 /*
-Copyright 2011 Google Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -710,22 +709,29 @@ func (c *Client) sendMultiItem(keys []*Item, cmd *pairCmd) (map[string]*Item, er
 	}
 
 	var chs []chan *Item
+	var errChs []chan error
 	for addr, keys := range keyMap {
 		ch := make(chan *Item)
 		chs = append(chs, ch)
-		go func(addr *Addr, keys []*Item, ch chan *Item) {
+		errCh := make(chan error, 1)
+		errChs = append(errChs, errCh)
+		go func(addr *Addr, keys []*Item, ch chan *Item, errCh chan error) {
 			defer close(ch)
+			defer close(errCh)
 			cn, err := c.getConn(addr)
 			if err != nil {
+				errCh <- err
 				return
 			}
 			defer c.condRelease(cn, &err)
 			for _, k := range keys {
 				if err = c.sendConnCommand(cn, k.Key, cmd.cmd, nil, 0, nil, k.VbucketId); err != nil {
+					errCh <- err
 					return
 				}
 			}
 			if err = c.sendConnCommand(cn, "", cmd.endCmd, nil, 0, nil, 0); err != nil {
+				errCh <- err
 				return
 			}
 			var item *Item
@@ -735,18 +741,29 @@ func (c *Client) sendMultiItem(keys []*Item, cmd *pairCmd) (map[string]*Item, er
 					// Noop response
 					break
 				}
+				if err != nil {
+					errCh <- err
+					return
+				}
 				ch <- item
 			}
-		}(addr, keys, ch)
+		}(addr, keys, ch, errCh)
 	}
 
 	m := make(map[string]*Item)
-	for _, ch := range chs {
+	var err error
+	for i, ch := range chs {
 		for item := range ch {
-			m[item.Key] = item
+			if item != nil {
+				m[item.Key] = item
+			}
+		}
+		err = <-errChs[i]
+		if err != nil {
+			break
 		}
 	}
-	return m, nil
+	return m, err
 
 }
 
